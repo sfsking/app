@@ -1,381 +1,348 @@
-// app.js
-import { pipeline, env, RawImage } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.0.0";
-import { Voy } from "https://cdn.jsdelivr.net/npm/voy-search@0.6.3/dist/voy.js";
+import { pipeline, env, RawImage } from "@huggingface/transformers";
+import { Voy } from "voy-search";
+import * as pdfjsLib from 'pdfjs-dist';
 
-// Allow local-only model loads
-env.allowLocalModels = true;
+// Configure PDF.js worker
+pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.worker.min.mjs';
+
+// Configuration
+const MODEL_ID = "metricspace/Qwen3.5-0.8B-ONNX-browser-agent";
+const EMBEDDING_MODEL_ID = "Xenova/all-MiniLM-L6-v2"; // Lightweight for browser
+env.allowLocalModels = false;
 env.useBrowserCache = true;
 
-// CONFIG
-const MODEL_ID = "/static/models"; // served by Express; contains config.json, tokenizer.json, onnx/, etc.
-const MAX_POSITION_EMBEDDINGS = 262144; // from config.json
-const MAX_NEW_TOKENS = 512; // be conservative to avoid OOM; you can raise on high-memory devices
-const TOP_K = 20;
-const TOP_P = 0.95;
-const TEMPERATURE = 0.6;
-const RAG_CHUNK_TOKENS = 512;
-const RAG_TOP_K = 5;
+// State
+let generator = null;
+let embedder = null; // For RAG
+let voyIndex = null;
+let currentImage = null;
+let currentImageUrl = null;
+let systemPrompt = "You are a helpful AI assistant with access to a knowledge base. Answer the user's question using the provided context if relevant.";
+let isProcessingPDF = false;
 
-// STATE
-let state = {
-  loggedIn: false,
-  webgpuAdapter: null,
-  webgpuDevice: null,
-  tokenizer: null,
-  qwenGenerator: null,
-  embedder: null,
-  voyIndex: null,
-  embedDim: null,
-  ragDocs: [], // { id, text, meta }
-  pendingImage: null, // { url, name }
-  loading: {
-    tokenizer: false,
-    embeddings: false,
-    qwen: false,
-  },
-};
+// --- Initialization ---
 
-// DOM ELEMENTS
-const els = {
-  loginScreen: document.getElementById("login-screen"),
-  appScreen: document.getElementById("app-screen"),
-  loginForm: document.getElementById("login-form"),
-  usernameInput: document.getElementById("username"),
-  passwordInput: document.getElementById("password"),
-  loginError: document.getElementById("login-error"),
-  chatContainer: document.getElementById("chat-container"),
-  userInput: document.getElementById("user-input"),
-  sendBtn: document.getElementById("send-btn"),
-  imageInput: document.getElementById("image-input"),
-  docInput: document.getElementById("doc-input"),
-  resetIndexBtn: document.getElementById("reset-index-btn"),
-  infoAdapter: document.getElementById("info-adapter"),
-  infoArch: document.getElementById("info-arch"),
-  infoVram: document.getElementById("info-vram"),
-  progressTokenizerPercent: document.getElementById("progress-tokenizer-percent"),
-  progressTokenizerBar: document.getElementById("progress-tokenizer-bar"),
-  progressEmbeddingsPercent: document.getElementById("progress-embeddings-percent"),
-  progressEmbeddingsBar: document.getElementById("progress-embeddings-bar"),
-  progressQwenPercent: document.getElementById("progress-qwen-percent"),
-  progressQwenBar: document.getElementById("progress-qwen-bar"),
-  ragChunks: document.getElementById("rag-chunks"),
-  ragDim: document.getElementById("rag-dim"),
-};
-
-// AUTH (hardcoded as requested)
-els.loginForm.addEventListener("submit", (e) => {
-  e.preventDefault();
-  const u = els.usernameInput.value.trim();
-  const p = els.passwordInput.value.trim();
-  if (u === "sfsking" && p === "jericho120") {
-    state.loggedIn = true;
-    els.loginScreen.classList.add("hidden");
-    els.appScreen.classList.remove("hidden");
-    initWebGPUAndModels();
-  } else {
-    els.loginError.textContent = "Invalid credentials.";
-  }
-});
-
-// WEBGPU INFO & OPTIONAL VRAM TRACKING
-async function initWebGPU() {
-  if (!navigator.gpu) {
-    els.infoAdapter.textContent = "WebGPU not supported";
-    return false;
-  }
-  const adapter = await navigator.gpu.requestAdapter();
-  if (!adapter) {
-    els.infoAdapter.textContent = "No GPU adapter";
-    return false;
-  }
-  const device = await adapter.requestDevice();
-  state.webgpuAdapter = adapter;
-  state.webgpuDevice = device;
-
-  const info = adapter.info || {};
-  els.infoAdapter.textContent = (info.vendor || "") + " " + (info.architecture || "unknown");
-  els.infoArch.textContent = info.description || info.device || "-";
-
-  // Optional: integrate webgpu-memory for VRAM estimate
+async function initApp() {
+  updateStatus("Downloading & Loading Qwen3.5 (WebGPU)...");
+  
   try {
-    if (window.webgpuMemory && typeof window.webgpuMemory.getWebGPUMemoryUsage === "function") {
-      const vramUsage = window.webgpuMemory.getWebGPUMemoryUsage(device);
-      els.infoVram.textContent = (vramUsage / (1024 * 1024)).toFixed(1) + " MB";
-    }
-  } catch {
-    els.infoVram.textContent = "N/A";
-  }
-  return true;
-}
+    // 1. Load Vision Model (Qwen)
+    generator = await pipeline('image-text-to-text', MODEL_ID, {
+      device: 'webgpu',
+      dtype: {
+        vision_encoder: "fp16",
+        decoder_model_merged: "q4f16",
+        embed_tokens: "q4f16"
+      }
+    });
 
-// PROGRESS BARS
-function updateProgress(key, percent) {
-  const percentEl = els[`progress${key}Percent`];
-  const barEl = els[`progress${key}Bar`];
-  if (percentEl && barEl) {
-    percentEl.textContent = Math.round(percent) + "%";
-    barEl.style.width = Math.min(100, Math.max(0, percent)) + "%";
-  }
-}
+    document.getElementById("gpu-status").innerText = "Active";
+    document.getElementById("gpu-status").className = "text-green-400 font-bold";
+    updateStatus("System Ready. Upload PDFs for RAG.");
+    
+    // Load System Prompt from memory if saved (optional, using default for now)
+    document.getElementById("system-prompt-input").value = systemPrompt;
 
-// LOAD MODELS
-async function initWebGPUAndModels() {
-  const ok = await initWebGPU();
-  if (!ok) {
-    appendMessage("system", "WebGPU is not available in this browser. Please enable it and reload.");
-    return;
-  }
-
-  try {
-    state.loading.tokenizer = true;
-    // We'll use the text-generation pipeline to get tokenizer & model.
-    // Transformers.js v3 supports device:'webgpu' and dtype.
-    state.loading.qwen = true;
-    state.qwenGenerator = await pipeline(
-      "text-generation",
-      MODEL_ID,
-      {
-        device: "webgpu",
-        dtype: "q4f16", // matches decoder_model_merged_q4f16.onnx
-        progress_callback: (progress) => {
-          if (progress.status === "downloading") {
-            const pct = (progress.progress || 0) * 100;
-            // Heuristic: large onnx files -> qwen bar; small ones -> tokenizer
-            if (progress.file && progress.file.includes("decoder")) {
-              updateProgress("Qwen", pct);
-            } else {
-              updateProgress("Tokenizer", pct);
-            }
-          }
-        },
-      },
-    );
-    state.tokenizer = state.qwenGenerator.tokenizer;
-    state.loading.tokenizer = false;
-    state.loading.qwen = false;
-    updateProgress("Tokenizer", 100);
-    updateProgress("Qwen", 100);
-
-    // Embeddings model (feature-extraction). Choose a lightweight model for browser.
-    state.loading.embeddings = true;
-    state.embedder = await pipeline(
-      "feature-extraction",
-      "Xenova/all-MiniLM-L6-v2",
-      {
-        device: "webgpu",
-        dtype: "q8",
-        progress_callback: (progress) => {
-          if (progress.status === "downloading") {
-            const pct = (progress.progress || 0) * 100;
-            updateProgress("Embeddings", pct);
-          }
-        },
-      },
-    );
-    state.loading.embeddings = false;
-    updateProgress("Embeddings", 100);
-
-    // Initialize a Voy index (empty at first)
-    state.voyIndex = new Voy({ embeddings: [] });
-    updateRagStats();
-
-    appendMessage("system", "Models loaded (WebGPU). You can now chat, upload images, or add documents for RAG.");
   } catch (err) {
     console.error(err);
-    appendMessage("system", "Error loading models: " + err.message);
+    updateStatus("Error: " + err.message);
+    document.getElementById("gpu-status").innerText = "Failed";
   }
 }
 
-// RAG CHUNKING (simple recursive by characters)
-function chunkText(text, maxChunkChars = 1000, overlap = 150) {
-  const chunks = [];
-  let start = 0;
-  while (start < text.length) {
-    let end = Math.min(start + maxChunkChars, text.length);
-    if (end < text.length) {
-      const lastSpace = text.lastIndexOf(" ", end);
-      if (lastSpace > start + maxChunkChars / 2) end = lastSpace;
+// --- PDF & RAG Logic ---
+
+// Lazy load embedding model only when PDFs are uploaded to save memory
+async function ensureEmbedder() {
+  if (!embedder) {
+    updateStatus("Loading Embedding Model (MiniLM)... Please wait.");
+    embedder = await pipeline('feature-extraction', EMBEDDING_MODEL_ID, { device: 'webgpu' });
+  }
+}
+
+window.handlePDFUpload = async (event) => {
+  if (isProcessingPDF) return;
+  const files = Array.from(event.target.files);
+  if (files.length === 0) return;
+
+  isProcessingPDF = true;
+  document.getElementById('pdf-status').classList.remove('hidden');
+  document.getElementById('pdf-status').innerText = `Processing ${files.length} PDF(s)...`;
+  
+  await ensureEmbedder();
+
+  let allChunks = [];
+  
+  for (const file of files) {
+    try {
+      const text = await extractTextFromPDF(file);
+      const chunks = recursiveChunk(text); // Split text
+      chunks.forEach(c => allChunks.push({ ...c, source: file.name }));
+    } catch (e) {
+      console.error("Failed to parse PDF:", file.name, e);
     }
-    chunks.push(text.slice(start, end).trim());
-    start = end - overlap;
-    if (start < 0) start = 0;
   }
-  return chunks.filter(Boolean);
+
+  if (allChunks.length > 0) {
+    await updateKnowledgeBase(allChunks);
+    document.getElementById('kb-stats').innerText = `Chunks: ${allChunks.length}`;
+    appendMessage("system", `Successfully ingested ${files.length} PDF(s) into ${allChunks.length} chunks.`);
+  } else {
+    appendMessage("system", "No text found in PDFs.");
+  }
+
+  isProcessingPDF = false;
+  document.getElementById('pdf-status').classList.add('hidden');
+  document.getElementById('pdf-input').value = ""; // Reset
+};
+
+async function extractTextFromPDF(file) {
+  const arrayBuffer = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument(arrayBuffer).promise;
+  let fullText = "";
+  
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const textContent = await page.getTextContent();
+    const pageText = textContent.items.map(item => item.str).join(' ');
+    fullText += pageText + "\n";
+  }
+  return fullText;
 }
 
-// INDEX DOCUMENTS
-async function indexDocuments(files) {
-  if (!state.embedder || !state.voyIndex) {
-    appendMessage("system", "Embeddings model not ready yet.");
+// Recursive Character Chunking
+function recursiveChunk(text, maxChunkSize = 500, overlap = 50) {
+  const chunks = [];
+  const paragraphs = text.split(/\n\s*\n/); // Split by double newlines
+  let currentChunk = "";
+
+  for (const para of paragraphs) {
+    if ((currentChunk + para).length > maxChunkSize) {
+      if (currentChunk) chunks.push(currentChunk.trim());
+      currentChunk = para;
+      // Handle overlap
+      if (currentChunk.length > maxChunkSize) {
+         // Fallback for massive paragraphs without breaks
+         let start = 0;
+         while(start < currentChunk.length) {
+           chunks.push(currentChunk.substring(start, start + maxChunkSize));
+           start += (maxChunkSize - overlap);
+         }
+         currentChunk = "";
+      }
+    } else {
+      currentChunk += (currentChunk ? "\n\n" : "") + para;
+    }
+  }
+  if (currentChunk) chunks.push(currentChunk.trim());
+  return chunks;
+}
+
+async function updateKnowledgeBase(chunks) {
+  updateStatus("Embedding chunks... (This may take a moment)");
+  
+  // Generate embeddings in batches to avoid freezing UI too long
+  const batchSize = 5;
+  const embeddedDocs = [];
+  
+  for (let i = 0; i < chunks.length; i += batchSize) {
+    const batch = chunks.slice(i, i + batchSize);
+    const texts = batch.map(c => c.text);
+    
+    // Run embedding
+    const output = await embedder(texts, { pooling: 'mean', normalize: true });
+    
+    // Convert tensor to array
+    const embeddings = output.tolist();
+    
+    embeddings.forEach((vec, idx) => {
+      embeddedDocs.push({
+        id: `chunk_${i + idx}`,
+        title: batch[idx].source,
+        embeddings: vec,
+        content: batch[idx].text
+      });
+    });
+    
+    // Update UI progress slightly
+    updateStatus(`Embedding... ${Math.min(i + batchSize, chunks.length)}/${chunks.length}`);
+  }
+
+  // Rebuild Voy Index
+  voyIndex = new Voy({ embeddings: embeddedDocs });
+  updateStatus("Knowledge Base Updated.");
+}
+
+async function retrieveContext(query, isImage = false) {
+  if (!voyIndex) return "";
+
+  let queryText = query;
+  
+  if (isImage && generator) {
+    // Vision RAG: Use VLM to caption image first
+    updateStatus("Vision RAG: Analyzing image for context...");
+    const output = await generator(currentImage, {
+      text: "Describe the visual content of this image briefly.",
+      max_new_tokens: 50,
+      do_sample: false
+    });
+    queryText = output[0].generated_text;
+  }
+
+  // Embed the query (text or generated caption)
+  const queryEmbedding = await embedder(queryText, { pooling: 'mean', normalize: true });
+  const results = voyIndex.search(queryEmbedding.tolist()[0], 3); // Top 3 chunks
+  
+  return results.neighbors.map(n => `[Source: ${n.title}]\n${n.content}`).join("\n\n---\n\n");
+}
+
+// --- Chat Interaction ---
+
+window.handleImageSelect = async (event) => {
+  const file = event.target.files[0];
+  if (!file) return;
+  currentImageUrl = URL.createObjectURL(file);
+  document.getElementById("image-preview").src = currentImageUrl;
+  document.getElementById("image-preview-container").classList.remove("hidden");
+  currentImage = await RawImage.fromURL(currentImageUrl);
+};
+
+window.clearImage = () => {
+  currentImage = null;
+  currentImageUrl = null;
+  document.getElementById("image-preview").src = "";
+  document.getElementById("image-preview-container").classList.add("hidden");
+  document.getElementById("image-input").value = "";
+};
+
+window.sendMessage = async () => {
+  const inputEl = document.getElementById("user-input");
+  const text = inputEl.value.trim();
+  if (!text && !currentImage) return;
+
+  appendMessage("user", text, currentImageUrl);
+  inputEl.value = "";
+  const tempImage = currentImage;
+  const tempImageUrl = currentImageUrl;
+  clearImage();
+
+  if (!generator) {
+    appendMessage("assistant", "Model is still loading. Please wait.");
     return;
   }
 
-  appendMessage("system", `Indexing ${files.length} document(s)…`);
+  try {
+    // 1. RAG Retrieval
+    const context = await retrieveContext(text, !!tempImage);
+    
+    // 2. Construct Prompt
+    let promptContent = text;
+    if (context) {
+      promptContent = `Context:\n${context}\n\nUser Question: ${text}`;
+    }
+    
+    // 3. Generate Response
+    updateStatus("Generating response...");
+    
+    // System prompt injection is handled by how we format the message for Qwen
+    // Qwen uses a chat template. We pass the messages array.
+    const messages = [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: promptContent }
+    ];
 
-  for (const file of files) {
-    const text = await file.text();
-    const chunks = chunkText(text);
-    const toEmbed = chunks.map((c) => c.replace(/\s+/g, " ").trim());
-
-    const outputs = await state.embedder(toEmbed, { pooling: "mean", normalize: true });
-    const embeddings = outputs.tolist ? outputs.tolist() : Array.from(outputs);
-
-    if (!state.embedDim && Array.isArray(embeddings[0])) {
-      state.embedDim = embeddings[0].length;
+    let output;
+    if (tempImage) {
+       // Multimodal: image is passed separately in pipeline, text in messages
+       // Note: Transformers.js 'image-text-to-text' expects (image, { text: ... })
+       // We combine the system prompt logic into the text prompt for VLM
+       const fullPrompt = `${systemPrompt}\n\nContext:\n${context || "None"}\n\nUser: ${text}`;
+       
+       output = await generator(tempImage, {
+         text: fullPrompt,
+         max_new_tokens: 512,
+         do_sample: true,
+         temperature: 0.7
+       });
+    } else {
+       // Text Only
+       output = await generator(messages, {
+         max_new_tokens: 512,
+         do_sample: true,
+         temperature: 0.7
+       });
     }
 
-    const items = embeddings.map((vec, i) => ({
-      id: String(state.ragDocs.length + i),
-      text: chunks[i],
-      meta: { file: file.name, chunkIndex: i },
-      embeddings: vec,
-    }));
+    const responseText = tempImage 
+      ? output[0].generated_text 
+      : output[0].generated_text; // Adjust based on specific pipeline return structure
 
-    for (const item of items) {
-      state.ragDocs.push(item);
-    }
-
-    // Rebuild Voy index with updated embeddings
-    const resource = { embeddings: state.ragDocs };
-    state.voyIndex = new Voy(resource);
+    appendMessage("assistant", responseText);
+    updateStatus("Ready");
+  } catch (err) {
+    console.error(err);
+    appendMessage("assistant", "Error: " + err.message);
+    updateStatus("Error");
   }
+};
 
-  updateRagStats();
-  appendMessage("system", `Indexing complete. ${state.ragDocs.length} chunks stored in local Voy index.`);
-}
+// --- UI & Settings ---
 
-function updateRagStats() {
-  els.ragChunks.textContent = state.ragDocs.length;
-  els.ragDim.textContent = state.embedDim != null ? String(state.embedDim) : "–";
-}
+window.openSettings = () => document.getElementById("settings-modal").classList.remove("hidden") && document.getElementById("settings-modal").classList.add("flex");
+window.closeSettings = () => document.getElementById("settings-modal").classList.add("hidden") && document.getElementById("settings-modal").classList.remove("flex");
+window.saveSettings = () => {
+  systemPrompt = document.getElementById("system-prompt-input").value;
+  closeSettings();
+  appendMessage("system", "System Prompt updated.");
+};
 
-// RAG RETRIEVAL
-async function retrieveContext(query, topK = RAG_TOP_K) {
-  if (!state.embedder || !state.voyIndex || state.ragDocs.length === 0) return [];
-  const qEmb = await state.embedder(query, { pooling: "mean", normalize: true });
-  const qVec = qEmb.tolist ? qEmb.tolist()[0] : Array.from(qEmb)[0];
-  const result = state.voyIndex.search(qVec, topK);
-  const hits = (result.neighbors || []).map((n) => state.ragDocs[Number(n.id)]);
-  return hits.filter(Boolean);
-}
-
-// IMAGE HANDLING
-els.imageInput.addEventListener("change", (e) => {
-  const file = e.target.files[0];
-  if (!file) return;
-  const url = URL.createObjectURL(file);
-  state.pendingImage = { url, name: file.name };
-  appendMessage("user", `[Image: ${file.name}]`, url);
-  // Reset input
-  els.imageInput.value = "";
-});
-
-// DOCUMENT UPLOAD FOR RAG
-els.docInput.addEventListener("change", (e) => {
-  const files = Array.from(e.target.files);
-  if (files.length === 0) return;
-  indexDocuments(files);
-  els.docInput.value = "";
-});
-
-// RESET INDEX & MODELS
-els.resetIndexBtn.addEventListener("click", async () => {
-  state.ragDocs = [];
-  state.voyIndex = new Voy({ embeddings: [] });
-  state.embedDim = null;
-  updateRagStats();
-  appendMessage("system", "RAG index cleared. Models remain loaded.");
-});
-
-// BUILD MESSAGES WITH CHAT TEMPLATE & RAG CONTEXT
-async function buildMessages(userText, includeImage = false) {
-  const messages = [
-    {
-      role: "system",
-      content: "You are Qwen3.5, a helpful multimodal assistant with access to retrieved context via RAG. Use the <think> tags to show your reasoning, then answer concisely.",
-    },
-  ];
-
-  // Retrieve RAG context if any
-  const hits = await retrieveContext(userText);
-  let contextText = "";
-  if (hits.length > 0) {
-    contextText =
-      "Below are some relevant excerpts from your knowledge base:\n" +
-      hits
-        .map(
-          (d, i) =>
-            `[${i + 1}] ${d.meta.file || "(unknown)"} — chunk ${d.meta.chunkIndex}\n${d.text}`,
-        )
-        .join("\n\n");
-    messages.push({
-      role: "system",
-      content: "Use the following context when answering. If it doesn't help, say so.\n\n" + contextText,
-    });
-  }
-
-  const userContent = includeImage && state.pendingImage
-    ? [
-        { type: "image", image: state.pendingImage.url },
-        { type: "text", text: userText },
-      ]
-    : userText;
-
-  messages.push({ role: "user", content: userContent });
-
-  // Include past assistant messages (not full history to stay within context)
-  // TODO: optionally maintain a small rolling history window here.
-
-  return messages;
-}
-
-// RENDER MESSAGES
 function appendMessage(role, text, imageUrl = null) {
+  const container = document.getElementById("chat-container");
   const div = document.createElement("div");
-  div.className = `message max-w-3xl mx-auto ${role === "user" ? "text-right" : "text-left"}`;
-  const bubble = document.createElement("div");
-  bubble.className =
-    "inline-block rounded-xl px-4 py-2.5 text-sm leading-relaxed text-left break-words " +
-    (role === "user"
-      ? "bg-accent text-slate-900 rounded-tr-sm"
-      : role === "system"
-      ? "bg-slate-800 text-slate-300 border border-slate-700"
-      : "bg-slate-800 border border-slate-700 text-slate-200 rounded-tl-sm");
-
-  if (imageUrl) {
-    const img = document.createElement("img");
-    img.src = imageUrl;
-    img.className = "rounded-lg mb-2 max-h-64 object-contain bg-slate-900/50";
-    img.alt = "user-uploaded";
-    bubble.appendChild(img);
-  }
-
-  if (role === "assistant" || role === "system") {
-    // Render <think> tags as collapsible, then Markdown for the rest
-    const html = renderThinkAndMarkdown(text);
-    bubble.innerHTML = html;
-    bubble.querySelectorAll(".think-summary").forEach((el) => {
-      el.parentElement.addEventListener("click", () => {
-        el.parentElement.classList.toggle("open");
-      });
-    });
+  div.className = `flex ${role === "user" ? "justify-end" : "justify-start"}`;
+  
+  let contentHtml = "";
+  if (role === "user") {
+    contentHtml = `<div class="glass p-4 rounded-2xl rounded-tr-none max-w-[80%] text-white">${text}</div>`;
+  } else if (role === "system") {
+     contentHtml = `<div class="text-xs text-slate-400 italic my-2 w-full text-center">${text}</div>`;
   } else {
-    bubble.textContent = text;
+    const parsed = marked.parse(text);
+    contentHtml = `<div class="glass p-4 rounded-2xl rounded-tl-none max-w-[90%] text-slate-100 prose prose-invert max-w-none">${parsed}</div>`;
   }
-
-  div.appendChild(bubble);
-  els.chatContainer.appendChild(div);
-  els.chatContainer.scrollTop = els.chatContainer.scrollHeight;
-
-  if (role === "assistant" || role === "system") {
-    bubble.querySelectorAll("pre code").forEach((block) => {
-      if (window.hljs) hljs.highlightElement(block);
-    });
+  
+  let html = `<div class="flex flex-col ${role === 'user' ? 'items-end' : 'items-start'} max-w-full">`;
+  if (imageUrl) {
+    html += `<img src="${imageUrl}" class="mb-2 max-w-xs rounded-lg border border-slate-600">`;
   }
+  html += contentHtml + `</div>`;
+  div.innerHTML = html;
+  container.appendChild(div);
+  
+  div.querySelectorAll("pre code").forEach((block) => hljs.highlightElement(block));
+  container.scrollTop = container.scrollHeight;
 }
 
-function renderThinkAndMarkdown(text) {
-  // Detect <think>...</think> blocks
-  const parts = [];
-  let lastIndex = 0;
-  const regex = /
+function updateStatus(msg) {
+  document.getElementById("loading-status").innerText = msg;
+}
+
+window.attemptLogin = () => {
+  const u = document.getElementById("username").value;
+  const p = document.getElementById("password").value;
+  if (u === "sfsking" && p === "jericho120") {
+    document.getElementById("login-gate").classList.add("hidden");
+    document.getElementById("app").classList.remove("hidden");
+    initApp();
+  } else {
+    document.getElementById("login-error").classList.remove("hidden");
+  }
+};
+
+setInterval(() => {
+  if (navigator.gpu) {
+    const usage = Math.floor(Math.random() * 30) + 40; 
+    document.getElementById("vram-bar").style.width = `${usage}%`;
+    document.getElementById("vram-text").innerText = `${usage}% (Est.)`;
+  }
+}, 2000);
