@@ -1,5 +1,5 @@
 {
-  "name": "qwen35-rag-kaggle-webgpu",
+  "name": "qwen35-vision-pdf-rag",
   "version": "1.0.0",
   "type": "module",
   "scripts": {
@@ -9,6 +9,7 @@
     "express": "^5.0.0",
     "@huggingface/transformers": "^4.0.0",
     "@pinggy/pinggy": "^0.3.6",
-    "voy-search": "^0.6.3"
+    "voy-search": "^0.6.3",
+    "pdfjs-dist": "^4.0.379"
   }
 }
