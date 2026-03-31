@@ -1,0 +1,14 @@
+{
+  "name": "qwen35-rag-kaggle-webgpu",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "express": "^5.0.0",
+    "@huggingface/transformers": "^4.0.0",
+    "@pinggy/pinggy": "^0.3.6",
+    "voy-search": "^0.6.3"
+  }
+}
