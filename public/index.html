@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <title>Qwen3.5 RAG (WebGPU) – Kaggle</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: "class",
+      theme: {
+        extend: {
+          colors: {
+            glass: "rgba(30, 41, 59, 0.75)",
+            glassBorder: "rgba(148, 163, 184, 0.35)",
+            accent: "#38bdf8",
+            accentHover: "#0ea5e9",
+          },
+          backdropBlur: {
+            xs: "2px",
+          },
+        },
+      },
+    };
+  </script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <style>
+    body { margin: 0; overflow: hidden; background: #020617; font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif; }
+    .glass-panel {
+      background: var(--tw-colors-glass);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      border: 1px solid var(--tw-colors-glassBorder);
+      box-shadow: 0 18px 40px rgba(0, 0, 0, 0.45);
+    }
+    #chat-container::-webkit-scrollbar { width: 8px; }
+    #chat-container::-webkit-scrollbar-thumb { background: #334155; border-radius: 99px; }
+    #chat-container::-webkit-scrollbar-track { background: transparent; }
+    .message pre { border-radius: 8px; margin-top: 6px; overflow-x: auto; font-size: 0.85rem; }
+    .message code { font-family: "Menlo", "Consolas", monospace; }
+    .message p { margin: 0.25rem 0; }
+    .message ul, .message ol { margin: 0.25rem 0; padding-left: 1.25rem; }
+    .think-block {
+      border-left: 3px solid #a855f7;
+      background: rgba(168, 85, 247, 0.08);
+      border-radius: 6px;
+      padding: 0.5rem 0.75rem;
+      margin: 0.5rem 0;
+      font-size: 0.9rem;
+      color: #e9d5ff;
+    }
+    .think-summary { cursor: pointer; user-select: none; display: flex; align-items: center; gap: 0.35rem; }
+    .think-summary::before { content: "▶"; font-size: 0.75rem; transition: transform 0.15s ease; }
+    .think-block.open > .think-summary::before { transform: rotate(90deg); }
+    .think-content { display: none; margin-top: 0.35rem; white-space: pre-wrap; }
+    .think-block.open > .think-content { display: block; }
+  </style>
+</head>
+<body class="text-slate-200 h-screen flex flex-col">
+  <!-- LOGIN GATE -->
+  <div id="login-screen" class="fixed inset-0 z-50 flex items-center justify-center bg-slate-950 bg-opacity-95">
+    <div class="glass-panel rounded-2xl p-8 w-full max-w-sm space-y-6 text-center">
+      <div>
+        <h1 class="text-2xl font-semibold text-slate-50">Qwen3.5 RAG</h1>
+        <p class="text-sm text-slate-400 mt-1">WebGPU • Vision • Local RAG</p>
+      </div>
+      <form id="login-form" class="space-y-4">
+        <div class="text-left space-y-1">
+          <label class="text-xs font-medium text-slate-400 uppercase tracking-wide">Username</label>
+          <input id="username" type="text" autocomplete="username" placeholder="sfsking"
+                 class="w-full bg-slate-900/80 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent placeholder-slate-600" />
+        </div>
+        <div class="text-left space-y-1">
+          <label class="text-xs font-medium text-slate-400 uppercase tracking-wide">Password</label>
+          <input id="password" type="password" autocomplete="current-password" placeholder="••••••••••••"
+                 class="w-full bg-slate-900/80 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent placeholder-slate-600" />
+        </div>
+        <button type="submit"
+                class="w-full bg-accent hover:bg-accentHover text-slate-900 font-medium text-sm rounded-lg py-2 transition-colors">
+          Sign in
+        </button>
+        <p id="login-error" class="text-xs text-red-400 min-h-[1.1rem]"></p>
+      </form>
+    </div>
+  </div>
+
+  <!-- MAIN APP (hidden until login) -->
+  <div id="app-screen" class="flex-1 flex min-h-0 hidden">
+    <!-- SIDEBAR: STATUS & CONTROLS -->
+    <aside class="w-64 flex flex-col border-r border-slate-800 bg-slate-950/90 text-xs">
+      <div class="p-3 border-b border-slate-800 flex items-center justify-between">
+        <span class="font-semibold text-slate-200">Status Dashboard</span>
+        <span class="text-[10px] text-slate-500">WebGPU</span>
+      </div>
+
+      <div class="p-3 space-y-3 overflow-y-auto">
+        <section class="space-y-1">
+          <h3 class="font-medium text-slate-400">WebGPU Info</h3>
+          <div class="grid grid-cols-2 gap-y-1 text-[11px]">
+            <span class="text-slate-500">Adapter</span>
+            <span id="info-adapter" class="text-slate-200 truncate">–</span>
+            <span class="text-slate-500">Architecture</span>
+            <span id="info-arch" class="text-slate-200 truncate">–</span>
+            <span class="text-slate-500">VRAM (est.)</span>
+            <span id="info-vram" class="text-accent">–</span>
+          </div>
+        </section>
+
+        <section class="space-y-1">
+          <h3 class="font-medium text-slate-400">Model Loading</h3>
+          <div class="space-y-1.5">
+            <div>
+              <div class="flex justify-between text-[11px] text-slate-400">
+                <span>Tokenizer & configs</span>
+                <span id="progress-tokenizer-percent">0%</span>
+              </div>
+              <div class="h-1.5 bg-slate-800 rounded-full mt-0.5 overflow-hidden">
+                <div id="progress-tokenizer-bar" class="h-full bg-emerald-500 transition-all duration-300" style="width: 0%"></div>
+              </div>
+            </div>
+            <div>
+              <div class="flex justify-between text-[11px] text-slate-400">
+                <span>Embeddings model</span>
+                <span id="progress-embeddings-percent">0%</span>
+              </div>
+              <div class="h-1.5 bg-slate-800 rounded-full mt-0.5 overflow-hidden">
+                <div id="progress-embeddings-bar" class="h-full bg-blue-500 transition-all duration-300" style="width: 0%"></div>
+              </div>
+            </div>
+            <div>
+              <div class="flex justify-between text-[11px] text-slate-400">
+                <span>Qwen3.5 model (WebGPU)</span>
+                <span id="progress-qwen-percent">0%</span>
+              </div>
+              <div class="h-1.5 bg-slate-800 rounded-full mt-0.5 overflow-hidden">
+                <div id="progress-qwen-bar" class="h-full bg-accent transition-all duration-300" style="width: 0%"></div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="space-y-1">
+          <h3 class="font-medium text-slate-400">RAG Index</h3>
+          <div class="text-[11px] text-slate-500">
+            <p>Indexed chunks: <span id="rag-chunks" class="text-slate-200">0</span></p>
+            <p class="mt-0.5">Embedding dim: <span id="rag-dim" class="text-slate-200">–</span></p>
+          </div>
+        </section>
+
+        <section class="pt-2">
+          <button id="reset-index-btn" class="w-full py-1.5 rounded border border-slate-700 hover:bg-slate-800 text-[11px] text-slate-300 transition-colors">
+            Reset RAG index & models
+          </button>
+        </section>
+      </div>
+
+      <div class="mt-auto p-2 border-t border-slate-800 text-[10px] text-slate-500">
+        Runs locally in your browser via WebGPU.
+      </div>
+    </aside>
+
+    <!-- CHAT AREA -->
+    <main class="flex-1 flex flex-col min-w-0 bg-slate-950/40">
+      <div id="chat-container" class="flex-1 overflow-y-auto px-4 py-4 space-y-4"></div>
+
+      <div class="p-3 border-t border-slate-800 bg-slate-950/80 flex items-end gap-2">
+        <label class="cursor-pointer p-2 rounded-lg hover:bg-slate-800 text-slate-400 transition-colors flex-shrink-0" title="Upload image (vision)">
+          <input id="image-input" type="file" accept="image/*" class="hidden" />
+          <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M17 8l-5-5-5 5M12 3v12"/></svg>
+        </label>
+        <div class="flex-1 flex items-center gap-2">
+          <input id="user-input" type="text" autocomplete="off" placeholder="Ask anything (text or image)…"
+                 class="flex-1 bg-slate-900/80 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-accent placeholder-slate-600" />
+          <label class="cursor-pointer p-2 rounded-lg hover:bg-slate-800 text-slate-400 transition-colors flex-shrink-0" title="Upload document (PDF/text for RAG)">
+            <input id="doc-input" type="file" accept=".pdf,.txt,.md" class="hidden" multiple />
+            <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 12h6M12 9v6M7 21a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+          </label>
+        </div>
+        <button id="send-btn" class="px-4 py-2 bg-accent hover:bg-accentHover text-slate-900 font-medium text-sm rounded-lg transition-colors">
+          Send
+        </button>
+      </div>
+    </main>
+  </div>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
